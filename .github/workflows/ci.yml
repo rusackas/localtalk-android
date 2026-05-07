@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/libs.versions.toml') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Check whether a new release is needed
+        id: release_check
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          VERSION="v$(grep versionName app/build.gradle.kts | head -1 | grep -o '[0-9.]*')"
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Tag $VERSION already exists — skipping release"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $VERSION does not exist — will release"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK (PRs)
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        run: ./gradlew assembleDebug
+
+      - name: Build release APK (unsigned)
+        if: steps.release_check.outputs.needed == 'true'
+        run: ./gradlew assembleRelease
+
+      - name: Sign APK
+        if: steps.release_check.outputs.needed == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo -n "$KEYSTORE_BASE64" | base64 --decode > release.jks
+          $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | tail -1)/apksigner sign \
+            --ks release.jks \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass pass:"$KEYSTORE_PASSWORD" \
+            --key-pass pass:"$KEY_PASSWORD" \
+            --out LocalTalk.apk \
+            app/build/outputs/apk/release/app-release-unsigned.apk
+          rm release.jks
+
+      - name: Tag and release
+        if: steps.release_check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release_check.outputs.version }}
+        run: |
+          git tag "$VERSION"
+          if ! git push origin "$VERSION" 2>push.err; then
+            if grep -q "already exists" push.err; then
+              echo "Tag pushed by concurrent run — skipping."
+              exit 0
+            fi
+            cat push.err >&2
+            exit 1
+          fi
+          gh release create "$VERSION" LocalTalk.apk \
+            --title "$VERSION" \
+            --notes "Download **LocalTalk.apk**, enable Unknown Sources in Settings, install, then open the app to complete setup."
